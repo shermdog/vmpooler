@@ -7,6 +7,7 @@ module Vmpooler
   require 'rbvmomi'
   require 'redis'
   require 'sinatra/base'
+  require "statsd-ruby"
   require 'time'
   require 'timeout'
   require 'yaml'
@@ -52,6 +53,10 @@ module Vmpooler
       parsed_config[:graphite]['prefix'] ||= 'vmpooler'
     end
 
+    if parsed_config[:statsd]['server']
+      parsed_config[:statsd]['prefix'] ||= 'vmpooler'
+    end
+
     if parsed_config[:tagfilter]
       parsed_config[:tagfilter].keys.each do |tag|
         parsed_config[:tagfilter][tag] = Regexp.new(parsed_config[:tagfilter][tag])
@@ -76,6 +81,14 @@ module Vmpooler
       nil
     else
       Vmpooler::Graphite.new server
+    end
+  end
+
+  def self.new_statsd(server)
+    if server.nil? or server.empty? or server.length == 0
+      nil
+    else
+      Statsd.new server, 8125
     end
   end
 

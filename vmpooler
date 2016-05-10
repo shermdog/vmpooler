@@ -9,6 +9,7 @@ config = Vmpooler.config
 redis_host = config[:redis]['server']
 logger_file = config[:config]['logfile']
 graphite = config[:graphite]['server'] ? config[:graphite]['server'] : nil
+statsd = config[:statsd]['server'] ? config[:statsd]['server'] : nil
 
 api = Thread.new {
   thr = Vmpooler::API.new
@@ -21,7 +22,8 @@ manager = Thread.new {
     config,
     Vmpooler.new_logger(logger_file),
     Vmpooler.new_redis(redis_host),
-    Vmpooler.new_graphite(graphite)
+    Vmpooler.new_graphite(graphite),
+    Vmpooler.new_statsd(statsd)
   ).execute!
 }
 

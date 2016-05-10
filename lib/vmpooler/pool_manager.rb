@@ -1,12 +1,17 @@
 module Vmpooler
   class PoolManager
-    def initialize(config, logger, redis, graphite=nil)
+    def initialize(config, logger, redis, graphite=nil, statsd=nil)
       $config = config
 
       # Load logger library
       $logger = logger
 
-      unless graphite.nil?
+      # statsd and graphite are mutex in the context of vmpooler
+      unless statsd.nil?
+        $statsd = statsd
+      end
+
+      unless graphite.nil? && !statsd.nil?
         $graphite = graphite
       end
 
@@ -79,14 +84,6 @@ module Vmpooler
 
     def check_ready_vm(vm, pool, ttl)
       Thread.new do
-        if ttl > 0
-          if (((Time.now - host.runtime.bootTime) / 60).to_s[/^\d+\.\d{1}/].to_f) > ttl
-            $redis.smove('vmpooler__ready__' + pool, 'vmpooler__completed__' + pool, vm)
-
-            $logger.log('d', "[!] [#{pool}] '#{vm}' reached end of TTL after #{ttl} minutes, removed from 'ready' queue")
-          end
-        end
-
         check_stamp = $redis.hget('vmpooler__vm__' + vm, 'check')
 
         if
@@ -168,31 +165,37 @@ module Vmpooler
     end
 
     # Clone a VM
-    def clone_vm(template, folder, datastore, target)
+    def clone_vm(pool, template, folder, datastore, target)
       Thread.new do
         vm = {}
-
+        $logger.log('d', "[!] [#{pool}] Trying to clone #{template}")
         if template =~ /\//
           templatefolders = template.split('/')
           vm['template'] = templatefolders.pop
         end
 
         if templatefolders
-          vm[vm['template']] = $vsphere[vm['template']].find_folder(templatefolders.join('/')).find(vm['template'])
+          begin
+            vm[vm['template']] = $vsphere[pool].find_folder(templatefolders.join('/')).find(vm['template'])
+          rescue => e
+            $logger.log('d', "[!] something is whack - #{e.message}")
+            #raise e
+            self.raise(e.message)
+          end
         else
-          fail 'Please provide a full path to the template'
+          raise 'Please provide a full path to the template'
         end
 
         if vm['template'].length == 0
-          fail "Unable to find template '#{vm['template']}'!"
+          raise "Unable to find template '#{vm['template']}'!"
         end
 
         # Generate a randomized hostname
         o = [('a'..'z'), ('0'..'9')].map(&:to_a).flatten
         vm['hostname'] = $config[:config]['prefix'] + o[rand(25)] + (0...14).map { o[rand(o.length)] }.join
 
-        # Add VM to Redis inventory ('pending' pool)
-        $redis.sadd('vmpooler__pending__' + vm['template'], vm['hostname'])
+        # Start tracking the clone
+        $redis.sadd('vmpooler__cloning__' + pool, vm['hostname'])
         $redis.hset('vmpooler__vm__' + vm['hostname'], 'clone', Time.now)
         $redis.hset('vmpooler__vm__' + vm['hostname'], 'template', vm['template'])
 
@@ -214,14 +217,14 @@ module Vmpooler
 
         # Choose a clone target
         if target
-          $clone_target = $vsphere[vm['template']].find_least_used_host(target)
+          $clone_target = $vsphere[pool].find_least_used_host(target)
         elsif $config[:config]['clone_target']
-          $clone_target = $vsphere[vm['template']].find_least_used_host($config[:config]['clone_target'])
+          $clone_target = $vsphere[pool].find_least_used_host($config[:config]['clone_target'])
         end
 
         # Put the VM in the specified folder and resource pool
         relocateSpec = RbVmomi::VIM.VirtualMachineRelocateSpec(
-          datastore: $vsphere[vm['template']].find_datastore(datastore),
+          datastore: $vsphere[pool].find_datastore(datastore),
           host: $clone_target,
           diskMoveType: :moveChildMostDiskBacking
         )
@@ -235,30 +238,36 @@ module Vmpooler
         )
 
         # Clone the VM
-        $logger.log('d', "[ ] [#{vm['template']}] '#{vm['hostname']}' is being cloned from '#{vm['template']}'")
+        $logger.log('d', "[ ] [#{pool}] '#{vm['hostname']}' is being cloned from '#{vm['template']}'")
 
         begin
           start = Time.now
           vm[vm['template']].CloneVM_Task(
-            folder: $vsphere[vm['template']].find_folder(folder),
+            folder: $vsphere[pool].find_folder(folder),
             name: vm['hostname'],
             spec: spec
           ).wait_for_completion
           finish = '%.2f' % (Time.now - start)
 
-          $redis.hset('vmpooler__clone__' + Date.today.to_s, vm['template'] + ':' + vm['hostname'], finish)
+          $redis.hset('vmpooler__clone__' + Date.today.to_s, pool + ':' + vm['hostname'], finish)
           $redis.hset('vmpooler__vm__' + vm['hostname'], 'clone_time', finish)
 
-          $logger.log('s', "[+] [#{vm['template']}] '#{vm['hostname']}' cloned from '#{vm['template']}' in #{finish} seconds")
+          # Add VM to Redis inventory ('pending' pool) after clone to avoid tracking zombie clones
+          $redis.srem('vmpooler__cloning__' + pool, vm['hostname'])
+          $redis.sadd('vmpooler__pending__' + pool, vm['hostname'])
+
+          $logger.log('s', "[+] [#{pool}] '#{vm['hostname']}' cloned from '#{vm['template']}' in #{finish} seconds")
         rescue
-          $logger.log('s', "[!] [#{vm['template']}] '#{vm['hostname']}' clone appears to have failed")
-          $redis.srem('vmpooler__pending__' + vm['template'], vm['hostname'])
+          $logger.log('s', "[!] [#{pool}] '#{vm['hostname']}' clone appears to have failed")
+          $redis.srem('vmpooler__cloning__' + pool, vm['hostname'])
+          $redis.decr('vmpooler__tasks__clone')
         end
 
         $redis.decr('vmpooler__tasks__clone')
 
         begin
-          $graphite.log($config[:graphite]['prefix'] + ".clone.#{vm['template']}", finish) if defined? $graphite
+          $graphite.log($config[:graphite]['prefix'] + ".clone.#{pool}", finish) if defined? $graphite
+          $statsd.timing($config[:statsd]['prefix'] + ".clone.#{pool}", finish) if defined? $statsd
         rescue
         end
       end
@@ -295,6 +304,7 @@ module Vmpooler
           $logger.log('s', "[-] [#{pool}] '#{vm}' destroyed in #{finish} seconds")
 
           $graphite.log($config[:graphite]['prefix'] + ".destroy.#{pool}", finish) if defined? $graphite
+          $statsd.timing($config[:statsd]['prefix'] + ".destroy.#{pool}", finish) if defined? $statsd
         end
       end
     end
@@ -400,8 +410,11 @@ module Vmpooler
     def check_disk_queue
       $logger.log('d', "[*] [disk_manager] starting worker thread")
 
-      $vsphere['disk_manager'] ||= Vmpooler::VsphereHelper.new
-
+      begin
+        $vsphere['disk_manager'] ||= Vmpooler::VsphereHelper.new
+      rescue => e
+        $logger.log('s', "[!] [disk_manager] unable to access vsphere - #{e.message}")
+      end
       $threads['disk_manager'] = Thread.new do
         loop do
           _check_disk_queue
@@ -426,7 +439,11 @@ module Vmpooler
     def check_snapshot_queue
       $logger.log('d', "[*] [snapshot_manager] starting worker thread")
 
-      $vsphere['snapshot_manager'] ||= Vmpooler::VsphereHelper.new
+      begin
+        $vsphere['snapshot_manager'] ||= Vmpooler::VsphereHelper.new
+      rescue => e
+        $logger.log('s', "[!] [snapshot_manager] unable to access vsphere - #{e.message}")
+      end
 
       $threads['snapshot_manager'] = Thread.new do
         loop do
@@ -463,7 +480,11 @@ module Vmpooler
     def check_pool(pool)
       $logger.log('d', "[*] [#{pool['name']}] starting worker thread")
 
-      $vsphere[pool['name']] ||= Vmpooler::VsphereHelper.new
+      begin
+        $vsphere[pool['name']] ||= Vmpooler::VsphereHelper.new
+      rescue => e
+        $logger.log('s', "[!] [#{pool['name']}] unable to access vsphere - #{e.message}")
+      end
 
       $threads[pool['name']] = Thread.new do
         loop do
@@ -478,6 +499,10 @@ module Vmpooler
       inventory = {}
       begin
         base = $vsphere[pool['name']].find_folder(pool['folder'])
+
+        if base.nil?
+          raise "#{pool['folder']} not found"
+        end
 
         base.childEntity.each do |vm|
           if
@@ -494,16 +519,23 @@ module Vmpooler
 
           inventory[vm['name']] = 1
         end
-      rescue
+      rescue => e
+        $logger.log('s', "[!] [#{pool['name']}] unable to check pool - #{e.message}")
       end
 
       # RUNNING
       $redis.smembers('vmpooler__running__' + pool['name']).each do |vm|
         if inventory[vm]
           begin
+            #$logger.log('s', "[?] [#{pool['name']}] '#{vm}' in running")
             check_running_vm(vm, pool['name'], $redis.hget('vmpooler__vm__' + vm, 'lifetime') || $config[:config]['vm_lifetime'] || 12)
           rescue
           end
+        else
+          $logger.log('s', "[!] [#{pool['name']}] '#{vm}' not found in inventory, removed from 'running' queue")
+          $redis.srem('vmpooler__running__' + pool['name'], vm)
+          $redis.hdel('vmpooler__active__' + pool['name'], vm)
+          $redis.del('vmpooler__vm__' + vm)
         end
       end
 
@@ -511,9 +543,15 @@ module Vmpooler
       $redis.smembers('vmpooler__ready__' + pool['name']).each do |vm|
         if inventory[vm]
           begin
+            #$logger.log('s', "[?] [#{pool['name']}] '#{vm}' in ready")
             check_ready_vm(vm, pool['name'], pool['ready_ttl'] || 0)
           rescue
           end
+        else
+          $logger.log('s', "[!] [#{pool['name']}] '#{vm}' not found in inventory, removed from 'ready' queue")
+          $redis.srem('vmpooler__ready__' + pool['name'], vm)
+          $redis.hdel('vmpooler__active__' + pool['name'], vm)
+          $redis.del('vmpooler__vm__' + vm)
         end
       end
 
@@ -521,9 +559,14 @@ module Vmpooler
       $redis.smembers('vmpooler__pending__' + pool['name']).each do |vm|
         if inventory[vm]
           begin
+            #$logger.log('s', "[?] [#{pool['name']}] '#{vm}' in pending")
             check_pending_vm(vm, pool['name'], pool['timeout'] || $config[:config]['timeout'] || 15)
           rescue
           end
+        else
+          $logger.log('s', "[!] [#{pool['name']}] '#{vm}' not found in inventory, removed from 'pending' queue")
+          $redis.srem('vmpooler__pending__' + pool['name'], vm)
+          $redis.del('vmpooler__vm__' + vm)
         end
       end
 
@@ -531,6 +574,7 @@ module Vmpooler
       $redis.smembers('vmpooler__completed__' + pool['name']).each do |vm|
         if inventory[vm]
           begin
+            #$logger.log('s', "[?] [#{pool['name']}] '#{vm}' in completed")
             destroy_vm(vm, pool['name'])
           rescue
             $logger.log('s', "[!] [#{pool['name']}] '#{vm}' destroy appears to have failed")
@@ -562,10 +606,15 @@ module Vmpooler
 
       # REPOPULATE
       ready = $redis.scard('vmpooler__ready__' + pool['name'])
-      total = $redis.scard('vmpooler__pending__' + pool['name']) + ready
+      cloning = $redis.scard('vmpooler__cloning__' + pool['name'])
+      pending = $redis.scard('vmpooler__pending__' + pool['name'])
+      total = ready + cloning + pending
 
       begin
-        if defined? $graphite
+        if defined? $statsd
+          $statsd.increment($config[:statsd]['prefix'] + '.ready.' + pool['name'], $redis.scard('vmpooler__ready__' + pool['name']))
+          $statsd.increment($config[:statsd]['prefix'] + '.running.' + pool['name'], $redis.scard('vmpooler__running__' + pool['name']))
+        elsif defined? $graphite
           $graphite.log($config[:graphite]['prefix'] + '.ready.' + pool['name'], $redis.scard('vmpooler__ready__' + pool['name']))
           $graphite.log($config[:graphite]['prefix'] + '.running.' + pool['name'], $redis.scard('vmpooler__running__' + pool['name']))
         end
@@ -590,13 +639,14 @@ module Vmpooler
               $redis.incr('vmpooler__tasks__clone')
 
               clone_vm(
+                pool['name'],
                 pool['template'],
                 pool['folder'],
                 pool['datastore'],
                 pool['clone_target']
               )
-            rescue
-              $logger.log('s', "[!] [#{pool['name']}] clone appears to have failed")
+            rescue => e
+              $logger.log('s', "[!] [#{pool['name']}] clone appears to have failed - #{e.message}")
               $redis.decr('vmpooler__tasks__clone')
             end
           end

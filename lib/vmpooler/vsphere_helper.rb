@@ -10,10 +10,14 @@ module Vmpooler
       config_file = File.expand_path('vmpooler.yaml')
       vsphere = YAML.load_file(config_file)[:vsphere]
 
-      @connection = RbVmomi::VIM.connect host: vsphere['server'],
-                                         user: vsphere['username'],
-                                         password: vsphere['password'],
-                                         insecure: true
+      begin
+        @connection = RbVmomi::VIM.connect host: vsphere['server'],
+                                     user: vsphere['username'],
+                                     password: vsphere['password'],
+                                     insecure: true
+      rescue
+        raise
+      end
     end
 
     def add_disk(vm, size, datastore)
